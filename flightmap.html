@@ -1,0 +1,377 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <style>
+        body { 
+            margin: 0;
+            font-family: Arial, sans-serif;
+        }
+        #metrics-container {
+            position: absolute;
+            top: 100px;
+            right: 20px;
+            color: white;
+            background: rgba(0, 0, 0, 0.6);
+            padding: 20px;
+            border-radius: 8px;
+            max-width: 300px;
+            backdrop-filter: blur(5px);
+            display: none;
+        }
+        .metric-group {
+            margin-bottom: 15px;
+        }
+        .metric-group h3 {
+            margin: 0 0 8px 0;
+            font-size: 14px;
+            color: #88ccff;
+        }
+        .metric-item {
+            margin: 5px 0;
+            font-size: 13px;
+        }
+        #input-container {
+            position: absolute;
+            top: 20px;
+            left: 50%;
+            transform: translateX(-50%);
+            z-index: 1000;
+            display: flex;
+            gap: 10px;
+        }
+        .location-input {
+            padding: 8px 12px;
+            border: 1px solid #ccc;
+            border-radius: 4px;
+            width: 200px;
+        }
+        #add-flight-btn {
+            padding: 8px 16px;
+            background: #4CAF50;
+            color: white;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+        }
+        #add-flight-btn:hover {
+            background: #45a049;
+        }
+        #error-message {
+            position: absolute;
+            top: 60px;
+            left: 50%;
+            transform: translateX(-50%);
+            color: red;
+            background: rgba(255, 255, 255, 0.9);
+            padding: 5px 10px;
+            border-radius: 4px;
+            display: none;
+        }
+    </style>
+    <script src="//unpkg.com/globe.gl"></script>
+</head>
+<body>
+    <div id="input-container">
+        <input type="text" id="from-input" class="location-input" placeholder="From (e.g., 'New York')">
+        <input type="text" id="to-input" class="location-input" placeholder="To (e.g., 'London')">
+        <button id="add-flight-btn">Add Flight Path</button>
+    </div>
+    <div id="error-message"></div>
+    <div id="globeViz"></div>
+    <div id="metrics-container">
+        <div class="metric-group">
+            <h3>Flight Information</h3>
+            <div id="flight-duration" class="metric-item"></div>
+            <div id="flight-distance" class="metric-item"></div>
+            <div id="time-difference" class="metric-item"></div>
+        </div>
+        <div class="metric-group">
+            <h3>Environmental Impact</h3>
+            <div id="co2-emissions" class="metric-item"></div>
+            <div id="fuel-consumption" class="metric-item"></div>
+        </div>
+        <div class="metric-group">
+            <h3>Route Details</h3>
+            <div id="avg-flights" class="metric-item"></div>
+            <div id="typical-aircraft" class="metric-item"></div>
+            <div id="cruising-altitude" class="metric-item"></div>
+        </div>
+    </div>
+
+    <script type="module">
+        import * as THREE from 'https://esm.sh/three';
+        import { GLTFLoader } from 'https://esm.sh/three/examples/jsm/loaders/GLTFLoader.js';
+
+        console.log('Script starting...');
+
+        const world = Globe()
+            .globeImageUrl('//unpkg.com/three-globe/example/img/earth-blue-marble.jpg')
+            .bumpImageUrl('//unpkg.com/three-globe/example/img/earth-topology.png')
+            .arcColor(() => '#ffff00')
+            .arcAltitude(0)
+            .arcStroke(1.5)
+            .arcsData([])
+            .pointsData([])
+            .pointColor(() => '#ff0000')
+            .pointAltitude(0.1)
+            .pointRadius(0.5)
+            (document.getElementById('globeViz'));
+
+        console.log('Globe initialized');
+
+        // Add lighting
+        const ambientLight = new THREE.AmbientLight(0xffffff, 0.6);
+        world.scene().add(ambientLight);
+
+        const directionalLight = new THREE.DirectionalLight(0xffffff, 0.6);
+        directionalLight.position.set(0, 1, 1);
+        world.scene().add(directionalLight);
+
+        // Constants for airplane
+        const AIRPLANE_SCALE = 0.5;
+        const AIRPLANE_ALTITUDE = 0.15;
+        let airplaneModel = null;
+
+        // Load airplane model with error handling
+        console.log('Starting to load airplane model...');
+        const loader = new GLTFLoader();
+        loader.load(
+            'Plane.glb', 
+            (gltf) => {
+                console.log('Airplane model loaded successfully');
+                airplaneModel = gltf.scene;
+                airplaneModel.scale.set(AIRPLANE_SCALE, AIRPLANE_SCALE, AIRPLANE_SCALE);
+            },
+            (progress) => {
+                console.log('Loading progress:', (progress.loaded / progress.total * 100) + '%');
+            },
+            (error) => {
+                console.error('Error loading airplane model:', error);
+            }
+        );
+
+        // Function to convert location to coordinates
+        async function getCoordinates(location) {
+            console.log('Getting coordinates for:', location);
+            try {
+                const response = await fetch(
+                    `https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(location)}&count=1&language=en&format=json`
+                );
+                const data = await response.json();
+                
+                if (data.results && data.results.length > 0) {
+                    return {
+                        lat: data.results[0].latitude,
+                        lng: data.results[0].longitude
+                    };
+                }
+                throw new Error('Location not found');
+            } catch (err) {
+                console.error('Error in getCoordinates:', err);
+                throw err;
+            }
+        }
+
+        // Function to calculate midpoint
+        function getMidpoint(start, end) {
+            return {
+                lat: (start.lat + end.lat) / 2,
+                lng: (start.lng + end.lng) / 2
+            };
+        }
+
+        // Handle adding flight path
+        let points = [];
+        let arcs = [];
+        
+        // Calculate great circle distance in kilometers
+        function calculateDistance(lat1, lon1, lat2, lon2) {
+            const R = 6371; // Earth's radius in km
+            const dLat = (lat2 - lat1) * Math.PI / 180;
+            const dLon = (lon2 - lon1) * Math.PI / 180;
+            const a = 
+                Math.sin(dLat/2) * Math.sin(dLat/2) +
+                Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) * 
+                Math.sin(dLon/2) * Math.sin(dLon/2);
+            const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+            return R * c;
+        }
+
+        // Calculate flight duration based on distance
+        function calculateFlightDuration(distance) {
+            const avgSpeed = 850; // Average cruising speed in km/h
+            const hours = distance / avgSpeed;
+            const fullHours = Math.floor(hours);
+            const minutes = Math.round((hours - fullHours) * 60);
+            return `${fullHours}h ${minutes}m`;
+        }
+
+        // Calculate CO2 emissions (rough estimate)
+        function calculateCO2(distance) {
+            // Average of 90kg CO2 per passenger per 1000km
+            return Math.round(distance * 0.09 * 300); // Assuming average 300 passengers
+        }
+
+        async function addFlightPath() {
+            console.log('Adding flight path...');
+            const fromLocation = document.getElementById('from-input').value.trim();
+            const toLocation = document.getElementById('to-input').value.trim();
+
+            if (!fromLocation || !toLocation) {
+                showError('Please enter both locations');
+                return;
+            }
+
+            try {
+                const startCoords = await getCoordinates(fromLocation);
+                const endCoords = await getCoordinates(toLocation);
+                console.log('Coordinates:', { start: startCoords, end: endCoords });
+
+                // Add points
+                points = [startCoords, endCoords];
+                world.pointsData(points);
+
+                // Add straight line
+                const arc = {
+                    startLat: startCoords.lat,
+                    startLng: startCoords.lng,
+                    endLat: endCoords.lat,
+                    endLng: endCoords.lng
+                };
+                arcs = [arc];
+                world.arcsData(arcs);
+
+                // Add airplane at midpoint
+                if (airplaneModel) {
+                    console.log('Adding airplane to scene');
+                    
+                    // Calculate the great circle distance
+                    const startRad = [startCoords.lng * Math.PI / 180, startCoords.lat * Math.PI / 180];
+                    const endRad = [endCoords.lng * Math.PI / 180, endCoords.lat * Math.PI / 180];
+                    
+                    // Get the exact midpoint along the great circle
+                    const Bx = Math.cos(endRad[1]) * Math.cos(endRad[0] - startRad[0]);
+                    const By = Math.cos(endRad[1]) * Math.sin(endRad[0] - startRad[0]);
+                    const midLat = Math.atan2(
+                        Math.sin(startRad[1]) + Math.sin(endRad[1]),
+                        Math.sqrt((Math.cos(startRad[1]) + Bx) * (Math.cos(startRad[1]) + Bx) + By * By)
+                    );
+                    const midLng = startRad[0] + Math.atan2(By, Math.cos(startRad[1]) + Bx);
+                    
+                    // Convert back to degrees
+                    const midpoint = {
+                        lat: midLat * 180 / Math.PI,
+                        lng: midLng * 180 / Math.PI
+                    };
+                    
+                    const midpointPos = world.getCoords(midpoint.lat, midpoint.lng, AIRPLANE_ALTITUDE);
+                    const startPos = world.getCoords(startCoords.lat, startCoords.lng, AIRPLANE_ALTITUDE);
+                    const endPos = world.getCoords(endCoords.lat, endCoords.lng, AIRPLANE_ALTITUDE);
+
+                    // Remove existing airplane if any
+                    const existingAirplane = world.scene().getObjectByName('airplane');
+                    if (existingAirplane) {
+                        world.scene().remove(existingAirplane);
+                    }
+
+                    // Add new airplane
+                    const airplane = airplaneModel.clone();
+                    airplane.position.set(midpointPos.x, midpointPos.y, midpointPos.z);
+                    airplane.name = 'airplane';
+
+                    // Calculate direction vector from current position to destination
+                    const direction = new THREE.Vector3()
+                        .subVectors(new THREE.Vector3(endPos.x, endPos.y, endPos.z),
+                                  new THREE.Vector3(midpointPos.x, midpointPos.y, midpointPos.z))
+                        .normalize();
+
+                    // Calculate up vector (from center of Earth to current position)
+                    const up = new THREE.Vector3(midpointPos.x, midpointPos.y, midpointPos.z).normalize();
+
+                    // Calculate right vector
+                    const right = new THREE.Vector3().crossVectors(up, direction).normalize();
+
+                    // Recalculate up vector to ensure perfect perpendicularity
+                    const correctedUp = new THREE.Vector3().crossVectors(direction, right).normalize();
+
+                    // Create and apply rotation matrix with reversed direction
+                    const rotationMatrix = new THREE.Matrix4();
+                    rotationMatrix.set(
+                        right.x, correctedUp.x, direction.x, 0,
+                        right.y, correctedUp.y, direction.y, 0,
+                        right.z, correctedUp.z, direction.z, 0,
+                        0, 0, 0, 1
+                    );
+
+                    airplane.rotation.setFromRotationMatrix(rotationMatrix);
+                    
+                    world.scene().add(airplane);
+                    console.log('Airplane added to scene');
+
+                    // Calculate and display metrics
+                    const distance = calculateDistance(
+                        startCoords.lat, startCoords.lng,
+                        endCoords.lat, endCoords.lng
+                    );
+                    const duration = calculateFlightDuration(distance);
+                    const co2 = calculateCO2(distance);
+
+                    // Update metrics display
+                    document.getElementById('flight-duration').textContent = `Flight Duration: ${duration}`;
+                    document.getElementById('flight-distance').textContent = `Distance: ${Math.round(distance)} km (${Math.round(distance * 0.621371)} miles)`;
+                    document.getElementById('time-difference').textContent = `Time Zones Crossed: ${Math.abs(Math.round(startCoords.lng - endCoords.lng) / 15)}`;
+                    
+                    document.getElementById('co2-emissions').textContent = `CO₂ Emissions: ${co2} tons`;
+                    document.getElementById('fuel-consumption').textContent = `Fuel Consumption: ${Math.round(distance * 0.1)} gallons`;
+
+                    document.getElementById('avg-flights').textContent = `Average Flights: 3-5 daily`;
+                    document.getElementById('typical-aircraft').textContent = `Common Aircraft: Boeing 777, Airbus A350`;
+                    document.getElementById('cruising-altitude').textContent = `Cruising Altitude: 35,000 ft`;
+
+                    // Show metrics container
+                    document.getElementById('metrics-container').style.display = 'block';
+                } else {
+                    console.warn('Airplane model not loaded yet');
+                }
+
+                // Center view on the arc
+                world.pointOfView({
+                    lat: (startCoords.lat + endCoords.lat) / 2,
+                    lng: (startCoords.lng + endCoords.lng) / 2,
+                    altitude: 2.5
+                }, 1000);
+
+                // Clear inputs
+                document.getElementById('from-input').value = '';
+                document.getElementById('to-input').value = '';
+                document.getElementById('error-message').style.display = 'none';
+
+            } catch (err) {
+                console.error('Error adding flight path:', err);
+                showError('Error finding locations. Please try again.');
+            }
+        }
+
+        function showError(message) {
+            const errorMessage = document.getElementById('error-message');
+            errorMessage.textContent = message;
+            errorMessage.style.display = 'block';
+        }
+
+        // Event listeners
+        document.getElementById('add-flight-btn').addEventListener('click', addFlightPath);
+        document.getElementById('from-input').addEventListener('keypress', (e) => {
+            if (e.key === 'Enter') document.getElementById('to-input').focus();
+        });
+        document.getElementById('to-input').addEventListener('keypress', (e) => {
+            if (e.key === 'Enter') addFlightPath();
+        });
+
+        // Enable controls and set rotation
+        world.controls().autoRotate = true;
+        world.controls().autoRotateSpeed = 0.7;
+
+        console.log('Setup complete');
+    </script>
+</body>
+</html>
